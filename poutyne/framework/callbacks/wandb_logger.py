@@ -1,6 +1,7 @@
 # pylint: disable=line-too-long, pointless-string-statement
 import os
 import warnings
+import torch
 from typing import Dict, Union, Mapping, Sequence,Optional
 
 from . import Logger
@@ -31,21 +32,26 @@ class WandBLogger(Logger):
         batch_granularity(bool): Whether to also output the result of each batch in addition to the epochs.
             (Default value = False).
         log_gradient_frequency(int): log gradients and parameters every N batches (Default value = None).
+        training_batch_shape(tuples): Shape of a training batch. It will be used for logging architecture of the model on wandb
         
 
     Example:
         .. code-block:: python
 
-            wandb_logger = WandBLogger(name="First_run", save_dir="/absolute/path/to/directory", experiment="First experiment")
+            wandb_logger = WandBLogger(name="First_run",project="Test_project" save_dir="/absolute/path/to/directory", experiment="First experiment")
             wandb_logger.log_config_params(config_params=cfg_dict) # logging the config dictionary
 
             # our Poutyne experiment
             experiment = Experiment(directory=saving_directory, network=network, device=device, optimizer=optimizer,
                             loss_function=cross_entropy_loss, batch_metrics=[accuracy])
 
-            # Using the MLflow logger callback during training
+            # Using the WandB logger callback during training
             experiment.train(train_generator=train_loader, valid_generator=valid_loader, epochs=1,
                              seed=42, callbacks=[wandb_logger])
+
+            # You can access the wandb run via the attribute .run if you want to use other wandb features
+            image = wandb.Image(an_image, caption="a caption") 
+            wandb_logger.run.log({"a exemple": image})
 
     """
 
@@ -61,6 +67,7 @@ class WandBLogger(Logger):
                     experiment=None,
                     batch_granularity: Optional[bool] = False,
                     log_gradient_frequency: Optional[bool] = None,
+                    training_batch_shape : Optional[tuple] = None
                 ) -> None:
 
         super().__init__(batch_granularity=batch_granularity)
@@ -84,23 +91,35 @@ class WandBLogger(Logger):
                 os.environ["WANDB_MODE"] = "dryrun"
 
             if wandb.run is None:
-                self.wandb_logger = wandb.init(**self._wandb_init)
+                self.run = wandb.init(**self._wandb_init)
             else:
                 warnings.warn(
                 "There is already a wandb run experience running. This callback will reuse this run. If you want to start a new one stop this process and call `wandb.finish()` before starting again."
             )
-                self.wandb_logger = wandb.run
+                self.run = wandb.run
         else:
-            self.wandb_logger = experiment
+            self.run = experiment
 
         self.log_gradient_frequency = log_gradient_frequency
-
+        self.training_batch_shape = training_batch_shape
 
     def _watch_gradient(self) -> None:
         """
             activate gradient watch 
         """
-        self.wandb_logger.watch(self.model.network, log_freq=self.log_gradient_frequency)
+        self.run.watch(self.model.network, log="all", log_freq=self.log_gradient_frequency)
+
+
+    def _save_architecture(self) -> None:
+            """
+                Save architecture
+            """
+            dummies_batch = torch.zeros(self.training_batch_shape)
+            save_path = self.run.dir+"/"+self.run.name+"_model.onnx"
+            torch.onnx.export(self.model.network,dummies_batch, save_path)
+            self.run.watch(self.model.network, log="all", log_freq=self.log_gradient_frequency)
+            self.run.save(save_path)
+
 
          
     def on_train_begin(self, logs: Dict):
@@ -108,44 +127,47 @@ class WandBLogger(Logger):
         if  self.log_gradient_frequency is not None:
             self._watch_gradient()
 
+        if self.training_batch_shape is not None:
+            self._save_architecture()
+
     def log_config_params(self, config_params: Dict) -> None:
         """
         Args:
             config_params Dict:
                 Dictionnary of config parameters of the training to log, such as number of epoch, loss function, optimizer etc.
         """
-        self.wandb_logger.config.update(config_params)
+        self.run.config.update(config_params)
 
         
     def _on_train_batch_end_write(self, batch_number: int, logs: Dict) -> None:
         """
         Log the batch metric.
         """
-        self.wandb_logger.log(logs)
+        adjusted_logs = self._adjust_logs_granularity(logs, per_batch=True)
+        self.run.log(adjusted_logs)
 
     def _on_epoch_end_write(self, epoch_number: int, logs: Dict) -> None:
         """
         Log the epoch metric.
         """
-        self.wandb_logger.log(logs)
+        adjusted_logs = self._adjust_logs_granularity(logs)
+        self.run.log(adjusted_logs)
 
     def on_train_end(self, logs: Dict):
 
-        self.wandb_logger.finish()
+        self.run.finish()
 
-    def _get_logs_without_unknown_keys(self, logs: Dict):
-        """
-        Clean log to get only the usefull values on wandb experiment
-        Args:
-            config_params Dict:
-                Dictionnary of config parameters of the training to log, such as number of epoch, loss function, optimizer etc.
+    def _adjust_logs_granularity(self,logs : Dict, per_batch=False) -> Dict:
+        if self.batch_granularity == False:
+            adjusted_logs =  logs
 
-        """
-        cleaned_dict = super()._get_logs_without_unknown_keys(logs)
-        cleaned_dict.pop("size",None)
-        cleaned_dict.pop("batch",None)
-        return cleaned_dict
+        else:
+            if per_batch:
+                adjusted_logs = {"Batch_"+metric: value for metric,value in logs.items()}
+            else:
+                adjusted_logs = {"Epoch_"+metric: value for metric,value in logs.items()}
 
+        return adjusted_logs
 
 
 
